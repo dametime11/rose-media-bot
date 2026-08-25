@@ -2,7 +2,9 @@ import os
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+import random
 
 import discord
 from discord import app_commands
@@ -24,6 +26,7 @@ SUBMIT_CHANNEL_ID = int(os.getenv("SUBMIT_CHANNEL_ID", "0") or 0)
 GET_KEY_CHANNEL_ID = int(os.getenv("GET_KEY_CHANNEL_ID", "0") or 0)
 
 DB_PATH = "rose_media.sqlite3"
+THUMBNAIL_DIR = "thumbnails"
 
 GAME_CHOICES = [
     "Rust",
@@ -75,7 +78,9 @@ def init_db():
         accepted_at TEXT,
         application_cooldown_until TEXT,
         free_key_used INTEGER NOT NULL DEFAULT 0,
+        free_thumbnail_used INTEGER NOT NULL DEFAULT 0,
         balance INTEGER NOT NULL DEFAULT 0,
+        thumbnail_balance INTEGER NOT NULL DEFAULT 0,
         tiktok_approved INTEGER NOT NULL DEFAULT 0,
         youtube_approved INTEGER NOT NULL DEFAULT 0
     );
@@ -246,15 +251,19 @@ def claim_key(user_id, game, duration, platform, is_free=False):
 def add_approved_credit(user_id, platform):
     # YouTube is treated as 3 TikTok-equivalent credits.
     credit = 1 if platform == "TikTok" else 3
+    thumbnail_credit = 1  # Each approved video gives 1 thumbnail credit
+    
     con = db()
     con.execute(
         """UPDATE users SET
            balance=balance+?,
+           thumbnail_balance=thumbnail_balance+?,
            tiktok_approved=tiktok_approved+?,
            youtube_approved=youtube_approved+?
            WHERE user_id=?""",
         (
             credit,
+            thumbnail_credit,
             1 if platform == "TikTok" else 0,
             1 if platform == "YouTube" else 0,
             user_id,
@@ -299,12 +308,201 @@ def spend_balance(user_id, cost):
     con.close()
     return changed > 0
 
+def spend_thumbnail(user_id):
+    con = db()
+    con.execute(
+        "UPDATE users SET thumbnail_balance=thumbnail_balance-1 WHERE user_id=? AND thumbnail_balance>0",
+        (user_id,)
+    )
+    changed = con.total_changes
+    con.commit()
+    con.close()
+    return changed > 0
+
+# -----------------------------
+# Free Thumbnail System
+# -----------------------------
+
+THUMBNAIL_GAMES = {
+    "Rust": "rust",
+    "Fortnite": "fortnite",
+    "Apex Legends": "apex",
+    "HWID Swoofer": "hwid-swoofer",
+}
+
+def get_thumbnail_files(game):
+    folder = Path(THUMBNAIL_DIR) / THUMBNAIL_GAMES[game]
+    if not folder.exists():
+        return []
+    return sorted(
+        [x for x in folder.iterdir()
+         if x.is_file() and x.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")],
+        key=lambda x: x.name.lower()
+    )
+
+class ThumbnailGameSelect(discord.ui.Select):
+    def __init__(self):
+        options = []
+        for game in THUMBNAIL_GAMES:
+            files = get_thumbnail_files(game)
+            if files:
+                options.append(discord.SelectOption(
+                    label=game, 
+                    value=game,
+                    description=f"{len(files)} thumbnails available"
+                ))
+            else:
+                options.append(discord.SelectOption(
+                    label=game, 
+                    value=game,
+                    description="No thumbnails available",
+                    emoji="❌"
+                ))
+        
+        super().__init__(
+            placeholder="Choose a game...",
+            options=options,
+            custom_id="rose_thumbnail_game",
+        )
+
+    async def callback(self, interaction):
+        game = self.values[0]
+        files = get_thumbnail_files(game)
+        
+        if not files:
+            await interaction.response.send_message(
+                f"❌ There are currently no {game} thumbnails uploaded.",
+                ephemeral=True,
+            )
+            return
+
+        user = get_user(interaction.user.id)
+        
+        # Check if user has thumbnail balance
+        if user["thumbnail_balance"] <= 0 and user["free_thumbnail_used"]:
+            await interaction.response.send_message(
+                f"❌ You have no thumbnail credits remaining.\n\n"
+                f"**How to earn more thumbnails:**\n"
+                f"• Submit and get approved videos (1 credit per approval)\n"
+                f"• Each approved video = 1 thumbnail credit\n"
+                f"• Your current balance: **{user['thumbnail_balance']}** credits\n\n"
+                f"*You got 1 free thumbnail when you joined!*",
+                ephemeral=True,
+            )
+            return
+
+        # Check if this is the user's first thumbnail (free)
+        if not user["free_thumbnail_used"]:
+            # Give first thumbnail for free
+            con = db()
+            con.execute(
+                "UPDATE users SET free_thumbnail_used=1 WHERE user_id=?",
+                (interaction.user.id,)
+            )
+            con.commit()
+            con.close()
+            
+            # Pick a random thumbnail
+            selected_file = random.choice(files)
+            
+            # Send the thumbnail in DM if possible
+            try:
+                await interaction.user.send(
+                    content=f"🖼️ **Free Thumbnail - {game}**\n\nHere's your free thumbnail! You get 1 free thumbnail as a new member.",
+                    file=discord.File(str(selected_file), filename=selected_file.name)
+                )
+                await interaction.response.send_message(
+                    f"✅ Thumbnail sent to your DMs! Check your messages. (1 free thumbnail used)",
+                    ephemeral=True
+                )
+            except discord.Forbidden:
+                # If DMs are closed, send in channel
+                await interaction.response.send_message(
+                    f"🖼️ **Free Thumbnail - {game}**",
+                    file=discord.File(str(selected_file), filename=selected_file.name),
+                    ephemeral=True
+                )
+            return
+
+        # Spend a thumbnail credit
+        if not spend_thumbnail(interaction.user.id):
+            await interaction.response.send_message(
+                f"❌ Failed to use thumbnail credit. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        # Pick a random thumbnail
+        selected_file = random.choice(files)
+        
+        # Get updated user info
+        user = get_user(interaction.user.id)
+        
+        # Send the thumbnail in DM if possible
+        try:
+            await interaction.user.send(
+                content=f"🖼️ **Thumbnail - {game}**\n\nHere's your thumbnail! You have **{user['thumbnail_balance']}** thumbnail credits remaining.",
+                file=discord.File(str(selected_file), filename=selected_file.name)
+            )
+            await interaction.response.send_message(
+                f"✅ Thumbnail sent to your DMs! You have **{user['thumbnail_balance']}** credits remaining.",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            # If DMs are closed, send in channel
+            await interaction.response.send_message(
+                f"🖼️ **Thumbnail - {game}**\n\nYou have **{user['thumbnail_balance']}** credits remaining.",
+                file=discord.File(str(selected_file), filename=selected_file.name),
+                ephemeral=True
+            )
+
+class ThumbnailGameView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ThumbnailGameSelect())
+
+class GetThumbnailButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🖼️ Get Thumbnail",
+            style=discord.ButtonStyle.primary,
+            custom_id="rose_get_thumbnail",
+        )
+
+    async def callback(self, interaction):
+        if not await require_media(interaction):
+            return
+        
+        user = get_user(interaction.user.id)
+        
+        embed = base_embed(
+            "🖼️ Free Thumbnails",
+            f"Choose a game to receive a random thumbnail.\n\n"
+            f"**Your Thumbnail Credits:** {user['thumbnail_balance']}\n"
+            f"**Free thumbnail used:** {'✅ Yes' if user['free_thumbnail_used'] else '❌ No (1 free available)'}\n\n"
+            f"**How to earn more:**\n"
+            f"• Submit videos for review\n"
+            f"• Get approved = 1 thumbnail credit\n"
+            f"• Unlimited earning potential!",
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=ThumbnailGameView(),
+            ephemeral=True,
+        )
+
+class ThumbnailPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(GetThumbnailButton())
+
 # -----------------------------
 # Discord helpers
 # -----------------------------
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 
 class RoseBot(commands.Bot):
     def __init__(self):
@@ -512,7 +710,12 @@ class ApplicationReviewView(discord.ui.View):
                 embed=base_embed(
                     "🎉 Media Application Accepted",
                     "You have been accepted into the **Rose Media Creator Program**!\n\n"
-                    "You now have access to the media channels. Use **Get Key** to request your first free key.",
+                    "You now have access to the media channels.\n\n"
+                    "**What you get:**\n"
+                    "• 1 Free game key (with content requirement)\n"
+                    "• 1 Free thumbnail\n"
+                    "• Earn more keys and thumbnails through approved content\n\n"
+                    "Use **Get Key** to request your first free key or **Get Thumbnail** for your free thumbnail.",
                     discord.Color.green(),
                 )
             )
@@ -895,12 +1098,15 @@ class StatsButton(discord.ui.Button):
             embed=base_embed(
                 "📊 Your Media Stats",
                 f"**Balance:** {user['balance']} credits\n"
+                f"**Thumbnail Credits:** {user['thumbnail_balance']}\n"
+                f"**Free Thumbnail Used:** {'✅ Yes' if user['free_thumbnail_used'] else '❌ No'}\n"
                 f"**Approved TikToks:** {user['tiktok_approved']}\n"
                 f"**Approved YouTube videos:** {user['youtube_approved']}\n"
                 f"**Pending submissions:** {pending_count}\n\n"
                 f"**Current key requirement:** {active_text}\n\n"
                 "**Credit values:** TikTok = 1, YouTube = 3\n"
-                "**Key costs:** 1d = 3, 3d = 6, 1w = 9, 1mo = 15",
+                "**Key costs:** 1d = 3, 3d = 6, 1w = 9, 1mo = 15\n"
+                "**Thumbnails:** 1 per approved video",
             ),
             ephemeral=True,
         )
@@ -978,10 +1184,16 @@ class VideoFeedbackModal(discord.ui.Modal, title="Video Review Feedback"):
             try:
                 title = "✅ Video Approved" if self.approved else "❌ Video Declined"
                 color = discord.Color.green() if self.approved else discord.Color.red()
+                user = get_user(self.user_id)
                 description = (
                     f"Your **{row['platform']}** submission has been approved.\n\n"
                     f"**Feedback:**\n{self.feedback.value}\n\n"
-                    f"Credits earned: **{3 if row['platform']=='YouTube' else 1}**"
+                    f"**Credits earned:**\n"
+                    f"• Key credits: **{3 if row['platform']=='YouTube' else 1}**\n"
+                    f"• Thumbnail credits: **1**\n\n"
+                    f"**Your balances:**\n"
+                    f"• Key credits: {user['balance']}\n"
+                    f"• Thumbnail credits: {user['thumbnail_balance']}"
                     if self.approved else
                     f"Your **{row['platform']}** submission was declined.\n\n"
                     f"**Feedback:**\n{self.feedback.value}"
@@ -1041,6 +1253,7 @@ async def setup(interaction: discord.Interaction):
     news = await ensure_channel(guild, "news", media_team)
     submit = await ensure_channel(guild, "submit-video", media_team)
     get_key = await ensure_channel(guild, "get-key", media_team)
+    thumbnails = await ensure_channel(guild, "free-thumbnails", media_team)
     chat = await ensure_channel(guild, "chat", media_team)
     media_help = await ensure_channel(guild, "media-help", media_team)
     bugs = await ensure_channel(guild, "bugs", media_team)
@@ -1055,6 +1268,7 @@ async def setup(interaction: discord.Interaction):
         "• Quality content that represents our brand\n\n"
         "**Benefits**\n"
         "• Free game keys\n"
+        "• Free thumbnails\n"
         "• Longer keys earned through approved content\n"
         "• Direct support from our team\n\n"
         "Click the button below to apply.\n"
@@ -1086,6 +1300,24 @@ async def setup(interaction: discord.Interaction):
         "Approved videos increase your balance. Use **My Stats** to check your balance and requirements.",
     )
     await submit.send(embed=submit_embed, view=SubmitStatsView())
+    
+    thumbnail_embed = base_embed(
+        "🖼️ Free Thumbnails",
+        "**Free YouTube Thumbnails for Media Creators**\n\n"
+        "Choose a game below to receive a random thumbnail.\n\n"
+        "**How it works:**\n"
+        "• New members get **1 free thumbnail**\n"
+        "• Submit videos to earn more thumbnail credits\n"
+        "• Each approved video = **1 thumbnail credit**\n"
+        "• Unlimited earning potential!\n\n"
+        "**Available Games:**\n"
+        "• 🦀 **Rust**\n"
+        "• 🔫 **Fortnite**\n"
+        "• 🎯 **Apex Legends**\n"
+        "• 💻 **HWID Swoofer**\n\n"
+        "📁 *Each thumbnail is sent to your DMs for maximum quality.*",
+    )
+    await thumbnails.send(embed=thumbnail_embed, view=ThumbnailPanelView())
 
     # Store IDs in the database so setup works even if .env isn't edited afterward.
     con = db()
@@ -1096,6 +1328,7 @@ async def setup(interaction: discord.Interaction):
         "apply_channel_id": apply_ch.id,
         "submit_channel_id": submit.id,
         "get_key_channel_id": get_key.id,
+        "thumbnails_channel_id": thumbnails.id,
     }.items():
         con.execute(
             "INSERT INTO setup(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1116,9 +1349,127 @@ async def setup(interaction: discord.Interaction):
         f"Media Creator role: `{role.id}`\n"
         f"Apply: {apply_ch.mention}\n"
         f"Submit: {submit.mention}\n"
-        f"Get Key: {get_key.mention}",
+        f"Get Key: {get_key.mention}\n"
+        f"Thumbnails: {thumbnails.mention}",
         ephemeral=True,
     )
+
+@bot.tree.command(name="setup_thumbnails", description="Set up or refresh the free thumbnails channel.")
+async def setup_thumbnails(interaction: discord.Interaction):
+    """Dedicated command to set up or refresh the thumbnail channel."""
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    # Find or create the Media Team category
+    media_team = discord.utils.get(guild.categories, name="Media Team")
+    if not media_team:
+        media_team = await guild.create_category("Media Team")
+
+    # Create or get the thumbnails channel
+    thumbnails_channel = discord.utils.get(guild.text_channels, name="free-thumbnails")
+    if not thumbnails_channel:
+        thumbnails_channel = await guild.create_text_channel(
+            "free-thumbnails",
+            category=media_team,
+            topic="Free thumbnails for content creators - select a game to download"
+        )
+
+    # Clear the channel and send fresh embed
+    await thumbnails_channel.purge(limit=100)
+
+    thumbnail_embed = base_embed(
+        "🖼️ Free Thumbnails",
+        "**Free YouTube Thumbnails for Media Creators**\n\n"
+        "Choose a game below to receive a random thumbnail.\n\n"
+        "**How it works:**\n"
+        "• New members get **1 free thumbnail**\n"
+        "• Submit videos to earn more thumbnail credits\n"
+        "• Each approved video = **1 thumbnail credit**\n"
+        "• Unlimited earning potential!\n\n"
+        "**Available Games:**\n"
+        "• 🦀 **Rust**\n"
+        "• 🔫 **Fortnite**\n"
+        "• 🎯 **Apex Legends**\n"
+        "• 💻 **HWID Swoofer**\n\n"
+        "📁 *Each thumbnail is sent to your DMs for maximum quality.*",
+    )
+    
+    await thumbnails_channel.send(embed=thumbnail_embed, view=ThumbnailPanelView())
+
+    # Store channel ID in database
+    con = db()
+    con.execute(
+        "INSERT INTO setup(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("thumbnails_channel_id", str(thumbnails_channel.id))
+    )
+    con.commit()
+    con.close()
+
+    await interaction.followup.send(
+        f"✅ Thumbnail channel set up successfully!\n"
+        f"Channel: {thumbnails_channel.mention}\n"
+        f"Users can now access thumbnails through the button in that channel.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="check_thumbnails", description="Check if thumbnails are properly set up.")
+async def check_thumbnails(interaction: discord.Interaction):
+    """Debug command to check thumbnail setup."""
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if thumbnail folder exists
+    thumbnail_path = Path(THUMBNAIL_DIR)
+    if not thumbnail_path.exists():
+        await interaction.followup.send(
+            "❌ Thumbnail directory doesn't exist. Create it with:\n"
+            "```\n"
+            "thumbnails/\n"
+            "├── rust/\n"
+            "├── fortnite/\n"
+            "├── apex/\n"
+            "└── hwid-swoofer/\n"
+            "```\n"
+            "Then add image files (.png, .jpg, .jpeg, .webp) to each folder.",
+            ephemeral=True
+        )
+        return
+
+    # Check each game folder
+    games_found = []
+    games_missing = []
+    
+    for game, folder_name in THUMBNAIL_GAMES.items():
+        game_folder = thumbnail_path / folder_name
+        if game_folder.exists():
+            files = [f for f in game_folder.iterdir() if f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp')]
+            if files:
+                games_found.append(f"✅ {game}: {len(files)} thumbnails found")
+            else:
+                games_missing.append(f"⚠️ {game}: Folder exists but no images found")
+        else:
+            games_missing.append(f"❌ {game}: Folder missing")
+
+    # Check channel
+    guild = interaction.guild
+    channel = discord.utils.get(guild.text_channels, name="free-thumbnails")
+    channel_status = f"✅ free-thumbnails exists" if channel else "❌ free-thumbnails channel missing"
+
+    response = (
+        f"**Thumbnail System Status**\n\n"
+        f"**Channel:** {channel_status}\n\n"
+        f"**Game Folders:**\n"
+        + "\n".join(games_found) + "\n" + "\n".join(games_missing)
+    )
+    
+    await interaction.followup.send(response, ephemeral=True)
 
 @bot.tree.command(name="addkey", description="Add one unused game key to inventory.")
 @app_commands.describe(game="Game name", duration="Key duration", key="The unused key")
@@ -1187,6 +1538,58 @@ async def reset_application(interaction, user: discord.Member):
     update_user(user.id, application_cooldown_until=None)
     await interaction.response.send_message(f"✅ Application cooldown reset for {user.mention}.", ephemeral=True)
 
+@bot.tree.command(name="add_thumbnails", description="Add thumbnail credits to a user.")
+@app_commands.describe(user="User to add credits to", amount="Number of credits to add")
+async def add_thumbnails(interaction, user: discord.Member, amount: int):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        return
+    
+    con = db()
+    con.execute(
+        "UPDATE users SET thumbnail_balance=thumbnail_balance+? WHERE user_id=?",
+        (amount, user.id)
+    )
+    con.commit()
+    con.close()
+    
+    updated_user = get_user(user.id)
+    await interaction.response.send_message(
+        f"✅ Added {amount} thumbnail credit(s) to {user.mention}.\n"
+        f"New balance: **{updated_user['thumbnail_balance']}** credits",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="add_keys", description="Add key credits to a user.")
+@app_commands.describe(user="User to add credits to", amount="Number of credits to add")
+async def add_keys(interaction, user: discord.Member, amount: int):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        return
+    
+    con = db()
+    con.execute(
+        "UPDATE users SET balance=balance+? WHERE user_id=?",
+        (amount, user.id)
+    )
+    con.commit()
+    con.close()
+    
+    updated_user = get_user(user.id)
+    await interaction.response.send_message(
+        f"✅ Added {amount} key credit(s) to {user.mention}.\n"
+        f"New balance: **{updated_user['balance']}** credits",
+        ephemeral=True
+    )
+
 # -----------------------------
 # Startup
 # -----------------------------
@@ -1204,6 +1607,7 @@ async def on_ready():
     bot.add_view(ApplyView())
     bot.add_view(GetKeyView())
     bot.add_view(SubmitStatsView())
+    bot.add_view(ThumbnailPanelView())
 
 if __name__ == "__main__":
     if not TOKEN:
