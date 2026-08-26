@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import random
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import discord
 from discord import app_commands
@@ -511,6 +513,22 @@ class RoseBot(commands.Bot):
             intents=intents,
             help_command=None,
         )
+
+    async def setup_hook(self):
+        # Register persistent views exactly once per process.
+        # This keeps buttons working after reconnects/restarts without
+        # repeatedly registering the same custom IDs from on_ready().
+        self.add_view(ApplyView())
+        self.add_view(GetKeyView())
+        self.add_view(SubmitStatsView())
+        self.add_view(ThumbnailPanelView())
+
+        # Guild-sync commands immediately to the configured server.
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"Synced commands to guild {GUILD_ID}")
 
 bot = RoseBot()
 
@@ -1591,28 +1609,68 @@ async def add_keys(interaction, user: discord.Member, amount: int):
     )
 
 # -----------------------------
-# Startup
+# Startup / Render health server
 # -----------------------------
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Tiny HTTP endpoint so Render can treat this as a Web Service."""
+
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        ready = bot.is_ready()
+        body = (
+            '{"status":"ok","discord_ready":'
+            + ("true" if ready else "false")
+            + '}\n'
+        ).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # Keep Render logs focused on the bot instead of HTTP probe noise.
+        return
+
+
+health_server = None
+
+
+def start_health_server():
+    global health_server
+    port = int(os.getenv("PORT", "10000"))
+    health_server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on 0.0.0.0:{port}")
+    health_server.serve_forever(poll_interval=0.5)
+
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"Synced commands to guild {GUILD_ID}")
 
-    # Persistent views survive restarts.
-    bot.add_view(ApplyView())
-    bot.add_view(GetKeyView())
-    bot.add_view(SubmitStatsView())
-    bot.add_view(ThumbnailPanelView())
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN is missing from .env")
+        raise SystemExit("DISCORD_TOKEN is missing from the environment")
     if not OWNER_ID or not GUILD_ID:
-        raise SystemExit("OWNER_ID and GUILD_ID must be set in .env")
+        raise SystemExit("OWNER_ID and GUILD_ID must be set in the environment")
+
     init_db()
-    bot.run(TOKEN)
+
+    # Render Web Services require one process to listen on $PORT.
+    # Run the health endpoint in a daemon thread while the Discord bot
+    # remains the main process, so a bot crash also makes the service fail
+    # instead of leaving a misleading HTTP-only process running.
+    threading.Thread(
+        target=start_health_server,
+        name="render-health-server",
+        daemon=True,
+    ).start()
+
+    bot.run(TOKEN, log_handler=None)
