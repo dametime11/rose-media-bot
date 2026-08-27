@@ -18,6 +18,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
 
 MEDIA_ROLE_ID = int(os.getenv("MEDIA_ROLE_ID", "0") or 0)
 MEDIA_INFO_CATEGORY_ID = int(os.getenv("MEDIA_INFO_CATEGORY_ID", "0") or 0)
@@ -84,7 +85,8 @@ def init_db():
         balance INTEGER NOT NULL DEFAULT 0,
         thumbnail_balance INTEGER NOT NULL DEFAULT 0,
         tiktok_approved INTEGER NOT NULL DEFAULT 0,
-        youtube_approved INTEGER NOT NULL DEFAULT 0
+        youtube_approved INTEGER NOT NULL DEFAULT 0,
+        warned_for_48h INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS applications (
@@ -135,7 +137,6 @@ def init_db():
         value TEXT NOT NULL
     );
     """)
-    # Seed user-supplied inventory once.
     count = con.execute("SELECT COUNT(*) AS c FROM keys").fetchone()["c"]
     if count == 0:
         con.executemany(
@@ -187,12 +188,9 @@ def requirement_done(user_id):
     return bool(active["requirement_completed"])
 
 def claim_key(user_id, game, duration, platform, is_free=False):
-    """Atomically claims one unused key and creates the user's active key lock."""
     con = db()
     try:
         con.execute("BEGIN IMMEDIATE")
-
-        # Clean up expired/completed active locks.
         active = con.execute(
             "SELECT * FROM active_keys WHERE user_id=?", (user_id,)
         ).fetchone()
@@ -215,8 +213,6 @@ def claim_key(user_id, game, duration, platform, is_free=False):
 
         issued = now()
         expires = issued + timedelta(days=DURATION_DAYS[duration]) if not is_free else None
-
-        # The initial free key always creates the 48-hour content requirement.
         target = 3 if platform == "TikTok" else 1
 
         con.execute(
@@ -251,9 +247,8 @@ def claim_key(user_id, game, duration, platform, is_free=False):
         con.close()
 
 def add_approved_credit(user_id, platform):
-    # YouTube is treated as 3 TikTok-equivalent credits.
     credit = 1 if platform == "TikTok" else 3
-    thumbnail_credit = 1  # Each approved video gives 1 thumbnail credit
+    thumbnail_credit = 1
     
     con = db()
     con.execute(
@@ -278,13 +273,6 @@ def add_approved_credit(user_id, platform):
 
     if active and not active["requirement_completed"]:
         if active["requirement_platform"] == platform:
-            count_col = "tiktok_approved" if platform == "TikTok" else "youtube_approved"
-            total = con.execute(
-                f"SELECT {count_col} AS c FROM users WHERE user_id=?",
-                (user_id,)
-            ).fetchone()["c"]
-            # Requirement is intentionally based on approvals made after the key.
-            # Use a submission-count check below for exact per-key accounting.
             cutoff = active["issued_at"]
             approved_after = con.execute(
                 """SELECT COUNT(*) AS c FROM submissions
@@ -321,6 +309,20 @@ def spend_thumbnail(user_id):
     con.close()
     return changed > 0
 
+def get_key_by_id(key_id):
+    con = db()
+    row = con.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+    con.close()
+    return row
+
+def delete_key_by_id(key_id):
+    con = db()
+    con.execute("DELETE FROM keys WHERE id=? AND claimed_by IS NULL", (key_id,))
+    changed = con.total_changes
+    con.commit()
+    con.close()
+    return changed > 0
+
 # -----------------------------
 # Free Thumbnail System
 # -----------------------------
@@ -342,161 +344,35 @@ def get_thumbnail_files(game):
         key=lambda x: x.name.lower()
     )
 
-class ThumbnailGameSelect(discord.ui.Select):
-    def __init__(self):
-        options = []
-        for game in THUMBNAIL_GAMES:
-            files = get_thumbnail_files(game)
-            if files:
-                options.append(discord.SelectOption(
-                    label=game, 
-                    value=game,
-                    description=f"{len(files)} thumbnails available"
-                ))
-            else:
-                options.append(discord.SelectOption(
-                    label=game, 
-                    value=game,
-                    description="No thumbnails available",
-                    emoji="❌"
-                ))
-        
-        super().__init__(
-            placeholder="Choose a game...",
-            options=options,
-            custom_id="rose_thumbnail_game",
-        )
+# -----------------------------
+# Logging Helper
+# -----------------------------
 
-    async def callback(self, interaction):
-        game = self.values[0]
-        files = get_thumbnail_files(game)
-        
-        if not files:
-            await interaction.response.send_message(
-                f"❌ There are currently no {game} thumbnails uploaded.",
-                ephemeral=True,
-            )
-            return
-
-        user = get_user(interaction.user.id)
-        
-        # Check if user has thumbnail balance
-        if user["thumbnail_balance"] <= 0 and user["free_thumbnail_used"]:
-            await interaction.response.send_message(
-                f"❌ You have no thumbnail credits remaining.\n\n"
-                f"**How to earn more thumbnails:**\n"
-                f"• Submit and get approved videos (1 credit per approval)\n"
-                f"• Each approved video = 1 thumbnail credit\n"
-                f"• Your current balance: **{user['thumbnail_balance']}** credits\n\n"
-                f"*You got 1 free thumbnail when you joined!*",
-                ephemeral=True,
-            )
-            return
-
-        # Check if this is the user's first thumbnail (free)
-        if not user["free_thumbnail_used"]:
-            # Give first thumbnail for free
-            con = db()
-            con.execute(
-                "UPDATE users SET free_thumbnail_used=1 WHERE user_id=?",
-                (interaction.user.id,)
-            )
-            con.commit()
-            con.close()
-            
-            # Pick a random thumbnail
-            selected_file = random.choice(files)
-            
-            # Send the thumbnail in DM if possible
-            try:
-                await interaction.user.send(
-                    content=f"🖼️ **Free Thumbnail - {game}**\n\nHere's your free thumbnail! You get 1 free thumbnail as a new member.",
-                    file=discord.File(str(selected_file), filename=selected_file.name)
-                )
-                await interaction.response.send_message(
-                    f"✅ Thumbnail sent to your DMs! Check your messages. (1 free thumbnail used)",
-                    ephemeral=True
-                )
-            except discord.Forbidden:
-                # If DMs are closed, send in channel
-                await interaction.response.send_message(
-                    f"🖼️ **Free Thumbnail - {game}**",
-                    file=discord.File(str(selected_file), filename=selected_file.name),
-                    ephemeral=True
-                )
-            return
-
-        # Spend a thumbnail credit
-        if not spend_thumbnail(interaction.user.id):
-            await interaction.response.send_message(
-                f"❌ Failed to use thumbnail credit. Please try again.",
-                ephemeral=True,
-            )
-            return
-
-        # Pick a random thumbnail
-        selected_file = random.choice(files)
-        
-        # Get updated user info
-        user = get_user(interaction.user.id)
-        
-        # Send the thumbnail in DM if possible
-        try:
-            await interaction.user.send(
-                content=f"🖼️ **Thumbnail - {game}**\n\nHere's your thumbnail! You have **{user['thumbnail_balance']}** thumbnail credits remaining.",
-                file=discord.File(str(selected_file), filename=selected_file.name)
-            )
-            await interaction.response.send_message(
-                f"✅ Thumbnail sent to your DMs! You have **{user['thumbnail_balance']}** credits remaining.",
-                ephemeral=True
-            )
-        except discord.Forbidden:
-            # If DMs are closed, send in channel
-            await interaction.response.send_message(
-                f"🖼️ **Thumbnail - {game}**\n\nYou have **{user['thumbnail_balance']}** credits remaining.",
-                file=discord.File(str(selected_file), filename=selected_file.name),
-                ephemeral=True
-            )
-
-class ThumbnailGameView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(ThumbnailGameSelect())
-
-class GetThumbnailButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(
-            label="🖼️ Get Thumbnail",
-            style=discord.ButtonStyle.primary,
-            custom_id="rose_get_thumbnail",
-        )
-
-    async def callback(self, interaction):
-        if not await require_media(interaction):
-            return
-        
-        user = get_user(interaction.user.id)
-        
-        embed = base_embed(
-            "🖼️ Free Thumbnails",
-            f"Choose a game to receive a random thumbnail.\n\n"
-            f"**Your Thumbnail Credits:** {user['thumbnail_balance']}\n"
-            f"**Free thumbnail used:** {'✅ Yes' if user['free_thumbnail_used'] else '❌ No (1 free available)'}\n\n"
-            f"**How to earn more:**\n"
-            f"• Submit videos for review\n"
-            f"• Get approved = 1 thumbnail credit\n"
-            f"• Unlimited earning potential!",
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=ThumbnailGameView(),
-            ephemeral=True,
-        )
-
-class ThumbnailPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(GetThumbnailButton())
+async def log_action(title: str, description: str, color: discord.Color = discord.Color.blue(), user: discord.Member = None):
+    """Send a log message to the configured log channel."""
+    if not LOG_CHANNEL_ID:
+        return
+    
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not channel:
+        return
+    
+    embed = discord.Embed(
+        title=f"📋 {title}",
+        description=description,
+        color=color,
+        timestamp=datetime.now()
+    )
+    embed.set_footer(text=f"User: {user.display_name if user else 'System'}")
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Failed to send log: {e}")
 
 # -----------------------------
 # Discord helpers
@@ -515,15 +391,11 @@ class RoseBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        # Register persistent views exactly once per process.
-        # This keeps buttons working after reconnects/restarts without
-        # repeatedly registering the same custom IDs from on_ready().
         self.add_view(ApplyView())
         self.add_view(GetKeyView())
         self.add_view(SubmitStatsView())
         self.add_view(ThumbnailPanelView())
 
-        # Guild-sync commands immediately to the configured server.
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -531,9 +403,6 @@ class RoseBot(commands.Bot):
             print(f"Synced commands to guild {GUILD_ID}")
 
 bot = RoseBot()
-
-def owner_only():
-    return OWNER_ID != 0
 
 async def owner_user():
     try:
@@ -663,6 +532,13 @@ class ApplicationModal(discord.ui.Modal, title="Media Creator Application"):
             )
             return
 
+        await log_action(
+            "📝 New Application Submitted",
+            f"**User:** {interaction.user.mention}\n**ID:** {app_id}\n**YouTube:** {youtube or 'None'}\n**TikTok:** {tiktok or 'None'}",
+            discord.Color.blurple(),
+            interaction.user
+        )
+
         await interaction.response.send_message(
             "✅ Application submitted. It has been sent to the media team for review.",
             ephemeral=True,
@@ -723,12 +599,18 @@ class ApplicationReviewView(discord.ui.View):
         con.commit()
         con.close()
 
+        await log_action(
+            "✅ Application Accepted",
+            f"**User:** {member.mention}\n**Application ID:** {self.app_id}",
+            discord.Color.green(),
+            member
+        )
+
         try:
             await member.send(
                 embed=base_embed(
                     "🎉 Media Application Accepted",
                     "You have been accepted into the **Rose Media Creator Program**!\n\n"
-                    "You now have access to the media channels.\n\n"
                     "**What you get:**\n"
                     "• 1 Free game key (with content requirement)\n"
                     "• 1 Free thumbnail\n"
@@ -790,6 +672,14 @@ class DeclineApplicationModal(discord.ui.Modal, title="Decline Application"):
 
         guild = bot.get_guild(GUILD_ID)
         member = guild.get_member(self.user_id) if guild else None
+        
+        await log_action(
+            "❌ Application Declined",
+            f"**User:** <@{self.user_id}>\n**Feedback:** {self.feedback.value}",
+            discord.Color.red(),
+            member
+        )
+
         if member:
             try:
                 await member.send(
@@ -807,6 +697,168 @@ class DeclineApplicationModal(discord.ui.Modal, title="Decline Application"):
             content=f"❌ Declined <@{self.user_id}>. Cooldown: 3 days.",
             view=None,
         )
+
+# -----------------------------
+# Thumbnail UI
+# -----------------------------
+
+class ThumbnailGameSelect(discord.ui.Select):
+    def __init__(self):
+        options = []
+        for game in THUMBNAIL_GAMES:
+            files = get_thumbnail_files(game)
+            if files:
+                options.append(discord.SelectOption(
+                    label=game, 
+                    value=game,
+                    description=f"{len(files)} thumbnails available"
+                ))
+            else:
+                options.append(discord.SelectOption(
+                    label=game, 
+                    value=game,
+                    description="No thumbnails available",
+                    emoji="❌"
+                ))
+        
+        super().__init__(
+            placeholder="Choose a game...",
+            options=options,
+            custom_id="rose_thumbnail_game",
+        )
+
+    async def callback(self, interaction):
+        game = self.values[0]
+        files = get_thumbnail_files(game)
+        
+        if not files:
+            await interaction.response.send_message(
+                f"❌ There are currently no {game} thumbnails uploaded.",
+                ephemeral=True,
+            )
+            return
+
+        user = get_user(interaction.user.id)
+        
+        if user["thumbnail_balance"] <= 0 and user["free_thumbnail_used"]:
+            await interaction.response.send_message(
+                f"❌ You have no thumbnail credits remaining.\n\n"
+                f"**How to earn more thumbnails:**\n"
+                f"• Submit and get approved videos (1 credit per approval)\n"
+                f"• Each approved video = 1 thumbnail credit\n"
+                f"• Your current balance: **{user['thumbnail_balance']}** credits\n\n"
+                f"*You got 1 free thumbnail when you joined!*",
+                ephemeral=True,
+            )
+            return
+
+        if not user["free_thumbnail_used"]:
+            con = db()
+            con.execute(
+                "UPDATE users SET free_thumbnail_used=1 WHERE user_id=?",
+                (interaction.user.id,)
+            )
+            con.commit()
+            con.close()
+            
+            selected_file = random.choice(files)
+            
+            await log_action(
+                "🖼️ Free Thumbnail Claimed",
+                f"**User:** {interaction.user.mention}\n**Game:** {game}\n**Type:** First free thumbnail",
+                discord.Color.green(),
+                interaction.user
+            )
+            
+            try:
+                await interaction.user.send(
+                    content=f"🖼️ **Free Thumbnail - {game}**\n\nHere's your free thumbnail! You get 1 free thumbnail as a new member.",
+                    file=discord.File(str(selected_file), filename=selected_file.name)
+                )
+                await interaction.response.send_message(
+                    f"✅ Thumbnail sent to your DMs! Check your messages. (1 free thumbnail used)",
+                    ephemeral=True
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"🖼️ **Free Thumbnail - {game}**",
+                    file=discord.File(str(selected_file), filename=selected_file.name),
+                    ephemeral=True
+                )
+            return
+
+        if not spend_thumbnail(interaction.user.id):
+            await interaction.response.send_message(
+                f"❌ Failed to use thumbnail credit. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        selected_file = random.choice(files)
+        user = get_user(interaction.user.id)
+        
+        await log_action(
+            "🖼️ Thumbnail Claimed",
+            f"**User:** {interaction.user.mention}\n**Game:** {game}\n**Credits remaining:** {user['thumbnail_balance']}",
+            discord.Color.blue(),
+            interaction.user
+        )
+        
+        try:
+            await interaction.user.send(
+                content=f"🖼️ **Thumbnail - {game}**\n\nHere's your thumbnail! You have **{user['thumbnail_balance']}** thumbnail credits remaining.",
+                file=discord.File(str(selected_file), filename=selected_file.name)
+            )
+            await interaction.response.send_message(
+                f"✅ Thumbnail sent to your DMs! You have **{user['thumbnail_balance']}** credits remaining.",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🖼️ **Thumbnail - {game}**\n\nYou have **{user['thumbnail_balance']}** credits remaining.",
+                file=discord.File(str(selected_file), filename=selected_file.name),
+                ephemeral=True
+            )
+
+class ThumbnailGameView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ThumbnailGameSelect())
+
+class GetThumbnailButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🖼️ Get Thumbnail",
+            style=discord.ButtonStyle.primary,
+            custom_id="rose_get_thumbnail",
+        )
+
+    async def callback(self, interaction):
+        if not await require_media(interaction):
+            return
+        
+        user = get_user(interaction.user.id)
+        
+        embed = base_embed(
+            "🖼️ Free Thumbnails",
+            f"Choose a game to receive a random thumbnail.\n\n"
+            f"**Your Thumbnail Credits:** {user['thumbnail_balance']}\n"
+            f"**Free thumbnail used:** {'✅ Yes' if user['free_thumbnail_used'] else '❌ No (1 free available)'}\n\n"
+            f"**How to earn more:**\n"
+            f"• Submit videos for review\n"
+            f"• Get approved = 1 thumbnail credit\n"
+            f"• Unlimited earning potential!",
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=ThumbnailGameView(),
+            ephemeral=True,
+        )
+
+class ThumbnailPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(GetThumbnailButton())
 
 # -----------------------------
 # Key UI
@@ -894,7 +946,6 @@ class DurationSelect(discord.ui.Select):
             )
             return
 
-        # First accepted user gets a free key.
         if not user["free_key_used"]:
             try:
                 key, issued = claim_key(
@@ -907,6 +958,13 @@ class DurationSelect(discord.ui.Select):
             except RuntimeError as e:
                 await interaction.response.send_message(f"❌ {e}", ephemeral=True)
                 return
+
+            await log_action(
+                "🔑 Free Key Claimed",
+                f"**User:** {interaction.user.mention}\n**Game:** {self.game}\n**Duration:** 3 days\n**Platform:** {self.platform}\n**Key:** ||{key}||",
+                discord.Color.green(),
+                interaction.user
+            )
 
             await interaction.response.send_message(
                 embed=base_embed(
@@ -946,13 +1004,19 @@ class DurationSelect(discord.ui.Select):
                 is_free=False,
             )
         except RuntimeError as e:
-            # Refund credits if no key exists.
             con = db()
             con.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (cost, interaction.user.id))
             con.commit()
             con.close()
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
+
+        await log_action(
+            "🔑 Key Claimed",
+            f"**User:** {interaction.user.mention}\n**Game:** {self.game}\n**Duration:** {duration}\n**Platform:** {self.platform}\n**Cost:** {cost} credits\n**Key:** ||{key}||",
+            discord.Color.blue(),
+            interaction.user
+        )
 
         await interaction.response.send_message(
             embed=base_embed(
@@ -1061,6 +1125,13 @@ class VideoSubmissionModal(discord.ui.Modal, title="Submit Video"):
                 ephemeral=True,
             )
             return
+
+        await log_action(
+            "📹 Video Submitted",
+            f"**User:** {interaction.user.mention}\n**Platform:** {platform}\n**URL:** [Link]({url})\n**Submission ID:** {sub_id}",
+            discord.Color.blue(),
+            interaction.user
+        )
 
         await interaction.response.send_message(
             "✅ Video submitted for review.",
@@ -1193,11 +1264,26 @@ class VideoFeedbackModal(discord.ui.Modal, title="Video Review Feedback"):
         con.commit()
         con.close()
 
-        if self.approved:
-            add_approved_credit(self.user_id, row["platform"])
-
         guild = bot.get_guild(GUILD_ID)
         member = guild.get_member(self.user_id) if guild else None
+
+        if self.approved:
+            add_approved_credit(self.user_id, row["platform"])
+            
+            await log_action(
+                "✅ Video Approved",
+                f"**User:** <@{self.user_id}>\n**Platform:** {row['platform']}\n**URL:** [Link]({row['url']})\n**Feedback:** {self.feedback.value}",
+                discord.Color.green(),
+                member
+            )
+        else:
+            await log_action(
+                "❌ Video Declined",
+                f"**User:** <@{self.user_id}>\n**Platform:** {row['platform']}\n**Feedback:** {self.feedback.value}",
+                discord.Color.red(),
+                member
+            )
+
         if member:
             try:
                 title = "✅ Video Approved" if self.approved else "❌ Video Declined"
@@ -1242,7 +1328,7 @@ async def setup(interaction: discord.Interaction):
         return
 
     global MEDIA_ROLE_ID, MEDIA_INFO_CATEGORY_ID, MEDIA_TEAM_CATEGORY_ID
-    global APPLY_CHANNEL_ID, SUBMIT_CHANNEL_ID, GET_KEY_CHANNEL_ID
+    global APPLY_CHANNEL_ID, SUBMIT_CHANNEL_ID, GET_KEY_CHANNEL_ID, LOG_CHANNEL_ID
 
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
@@ -1272,9 +1358,13 @@ async def setup(interaction: discord.Interaction):
     submit = await ensure_channel(guild, "submit-video", media_team)
     get_key = await ensure_channel(guild, "get-key", media_team)
     thumbnails = await ensure_channel(guild, "free-thumbnails", media_team)
+    log_channel = await ensure_channel(guild, "bot-logs", media_team)
     chat = await ensure_channel(guild, "chat", media_team)
     media_help = await ensure_channel(guild, "media-help", media_team)
     bugs = await ensure_channel(guild, "bugs", media_team)
+
+    # Set LOG_CHANNEL_ID globally
+    LOG_CHANNEL_ID = log_channel.id
 
     apply_embed = base_embed(
         "📝 Media Creator Applications",
@@ -1337,7 +1427,13 @@ async def setup(interaction: discord.Interaction):
     )
     await thumbnails.send(embed=thumbnail_embed, view=ThumbnailPanelView())
 
-    # Store IDs in the database so setup works even if .env isn't edited afterward.
+    log_embed = discord.Embed(
+        title="📋 Bot Logs",
+        description="All important bot actions will be logged here.",
+        color=discord.Color.blue()
+    )
+    await log_channel.send(embed=log_embed)
+
     con = db()
     for k, v in {
         "media_role_id": role.id,
@@ -1347,6 +1443,7 @@ async def setup(interaction: discord.Interaction):
         "submit_channel_id": submit.id,
         "get_key_channel_id": get_key.id,
         "thumbnails_channel_id": thumbnails.id,
+        "log_channel_id": log_channel.id,
     }.items():
         con.execute(
             "INSERT INTO setup(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1368,13 +1465,13 @@ async def setup(interaction: discord.Interaction):
         f"Apply: {apply_ch.mention}\n"
         f"Submit: {submit.mention}\n"
         f"Get Key: {get_key.mention}\n"
-        f"Thumbnails: {thumbnails.mention}",
+        f"Thumbnails: {thumbnails.mention}\n"
+        f"Logs: {log_channel.mention}",
         ephemeral=True,
     )
 
 @bot.tree.command(name="setup_thumbnails", description="Set up or refresh the free thumbnails channel.")
 async def setup_thumbnails(interaction: discord.Interaction):
-    """Dedicated command to set up or refresh the thumbnail channel."""
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
@@ -1382,12 +1479,10 @@ async def setup_thumbnails(interaction: discord.Interaction):
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
 
-    # Find or create the Media Team category
     media_team = discord.utils.get(guild.categories, name="Media Team")
     if not media_team:
         media_team = await guild.create_category("Media Team")
 
-    # Create or get the thumbnails channel
     thumbnails_channel = discord.utils.get(guild.text_channels, name="free-thumbnails")
     if not thumbnails_channel:
         thumbnails_channel = await guild.create_text_channel(
@@ -1396,7 +1491,6 @@ async def setup_thumbnails(interaction: discord.Interaction):
             topic="Free thumbnails for content creators - select a game to download"
         )
 
-    # Clear the channel and send fresh embed
     await thumbnails_channel.purge(limit=100)
 
     thumbnail_embed = base_embed(
@@ -1418,7 +1512,6 @@ async def setup_thumbnails(interaction: discord.Interaction):
     
     await thumbnails_channel.send(embed=thumbnail_embed, view=ThumbnailPanelView())
 
-    # Store channel ID in database
     con = db()
     con.execute(
         "INSERT INTO setup(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1429,38 +1522,26 @@ async def setup_thumbnails(interaction: discord.Interaction):
 
     await interaction.followup.send(
         f"✅ Thumbnail channel set up successfully!\n"
-        f"Channel: {thumbnails_channel.mention}\n"
-        f"Users can now access thumbnails through the button in that channel.",
+        f"Channel: {thumbnails_channel.mention}",
         ephemeral=True
     )
 
 @bot.tree.command(name="check_thumbnails", description="Check if thumbnails are properly set up.")
 async def check_thumbnails(interaction: discord.Interaction):
-    """Debug command to check thumbnail setup."""
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     
-    # Check if thumbnail folder exists
     thumbnail_path = Path(THUMBNAIL_DIR)
     if not thumbnail_path.exists():
         await interaction.followup.send(
-            "❌ Thumbnail directory doesn't exist. Create it with:\n"
-            "```\n"
-            "thumbnails/\n"
-            "├── rust/\n"
-            "├── fortnite/\n"
-            "├── apex/\n"
-            "└── hwid-swoofer/\n"
-            "```\n"
-            "Then add image files (.png, .jpg, .jpeg, .webp) to each folder.",
+            "❌ Thumbnail directory doesn't exist.",
             ephemeral=True
         )
         return
 
-    # Check each game folder
     games_found = []
     games_missing = []
     
@@ -1475,7 +1556,6 @@ async def check_thumbnails(interaction: discord.Interaction):
         else:
             games_missing.append(f"❌ {game}: Folder missing")
 
-    # Check channel
     guild = interaction.guild
     channel = discord.utils.get(guild.text_channels, name="free-thumbnails")
     channel_status = f"✅ free-thumbnails exists" if channel else "❌ free-thumbnails channel missing"
@@ -1514,30 +1594,173 @@ async def addkey(interaction, game: str, duration: str, key: str):
         await interaction.response.send_message("That key already exists in the inventory.", ephemeral=True)
         return
     con.close()
+
+    await log_action(
+        "➕ Key Added",
+        f"**Game:** {game}\n**Duration:** {duration}\n**Key:** ||{key}||",
+        discord.Color.green()
+    )
+
     await interaction.response.send_message("✅ Key added to inventory.", ephemeral=True)
 
-@bot.tree.command(name="keys", description="Show unused key inventory.")
-async def keys(interaction):
+@bot.tree.command(name="keys", description="Show all unused keys in inventory.")
+async def keys(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
+    
     con = db()
     rows = con.execute(
-        """SELECT game,duration,COUNT(*) AS c
-           FROM keys WHERE claimed_by IS NULL
-           GROUP BY game,duration ORDER BY game,duration"""
+        """SELECT id, game, duration, key_value FROM keys WHERE claimed_by IS NULL ORDER BY game, duration"""
     ).fetchall()
     con.close()
 
-    text = "\n".join(f"• {r['game']} — {r['duration']}: **{r['c']}**" for r in rows) or "No unused keys."
+    if not rows:
+        await interaction.response.send_message(
+            embed=base_embed("🔐 Key Inventory", "No unused keys available."),
+            ephemeral=True,
+        )
+        return
+
+    # Group by game
+    grouped = {}
+    for row in rows:
+        key = f"{row['game']} - {row['duration']}"
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(row["key_value"])
+
+    description = ""
+    for key_group, keys_list in grouped.items():
+        description += f"**{key_group}** ({len(keys_list)} keys):\n"
+        for k in keys_list:
+            description += f"• `{k}`\n"
+        description += "\n"
+
     await interaction.response.send_message(
-        embed=base_embed("🔐 Key Inventory", text),
+        embed=base_embed("🔐 Key Inventory", description[:4000]),
         ephemeral=True,
     )
 
+@bot.tree.command(name="removekey", description="Remove a specific key from inventory by its value.")
+@app_commands.describe(key_value="The exact key value to remove")
+async def removekey(interaction: discord.Interaction, key_value: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    con = db()
+    row = con.execute(
+        "SELECT * FROM keys WHERE key_value=? AND claimed_by IS NULL", 
+        (key_value.strip(),)
+    ).fetchone()
+    
+    if not row:
+        con.close()
+        await interaction.response.send_message("❌ Key not found or already claimed.", ephemeral=True)
+        return
+
+    con.execute("DELETE FROM keys WHERE id=?", (row["id"],))
+    con.commit()
+    con.close()
+
+    await log_action(
+        "🗑️ Key Removed",
+        f"**Game:** {row['game']}\n**Duration:** {row['duration']}\n**Key:** ||{key_value}||",
+        discord.Color.red()
+    )
+
+    await interaction.response.send_message(f"✅ Removed key: `{key_value}`", ephemeral=True)
+
+@bot.tree.command(name="addkeys_bulk", description="Add multiple keys at once.")
+@app_commands.describe(keys="Format: game|duration|key (one per line)")
+async def addkeys_bulk(interaction: discord.Interaction, keys: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    lines = keys.strip().split("\n")
+    added = 0
+    failed = 0
+
+    con = db()
+    for line in lines:
+        parts = line.split("|")
+        if len(parts) != 3:
+            failed += 1
+            continue
+        game, duration, key = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if game not in GAME_CHOICES or duration not in ("1 day", "3 days", "1 week", "1 month"):
+            failed += 1
+            continue
+        try:
+            con.execute(
+                "INSERT INTO keys(game,duration,key_value) VALUES(?,?,?)",
+                (game, duration, key)
+            )
+            added += 1
+        except sqlite3.IntegrityError:
+            failed += 1
+    
+    con.commit()
+    con.close()
+
+    await log_action(
+        "📦 Bulk Keys Added",
+        f"**Added:** {added}\n**Failed:** {failed}",
+        discord.Color.green()
+    )
+
+    await interaction.response.send_message(
+        f"✅ Added {added} keys. Failed: {failed}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="reset_user", description="Reset a user's progress and obligations.")
+@app_commands.describe(user="User to reset")
+async def reset_user(interaction: discord.Interaction, user: discord.Member):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    con = db()
+    con.execute("DELETE FROM active_keys WHERE user_id=?", (user.id,))
+    con.execute(
+        "UPDATE users SET free_key_used=0, free_thumbnail_used=0 WHERE user_id=?",
+        (user.id,)
+    )
+    con.commit()
+    con.close()
+
+    await log_action(
+        "🔄 User Reset",
+        f"**User:** {user.mention}\n**Progress reset**",
+        discord.Color.orange(),
+        user
+    )
+
+    await interaction.response.send_message(f"✅ Reset progress for {user.mention}.", ephemeral=True)
+
+@bot.tree.command(name="reset_application", description="Let a user apply again immediately.")
+@app_commands.describe(user="User to reset")
+async def reset_application(interaction: discord.Interaction, user: discord.Member):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    update_user(user.id, application_cooldown_until=None)
+
+    await log_action(
+        "🔄 Application Reset",
+        f"**User:** {user.mention}\n**Application cooldown removed**",
+        discord.Color.orange(),
+        user
+    )
+
+    await interaction.response.send_message(f"✅ Application cooldown reset for {user.mention}.", ephemeral=True)
+
 @bot.tree.command(name="cancel_key", description="Manually release a user's active requirement/key lock.")
 @app_commands.describe(user="User whose active key requirement should be released")
-async def cancel_key(interaction, user: discord.Member):
+async def cancel_key(interaction: discord.Interaction, user: discord.Member):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
@@ -1545,20 +1768,19 @@ async def cancel_key(interaction, user: discord.Member):
     con.execute("DELETE FROM active_keys WHERE user_id=?", (user.id,))
     con.commit()
     con.close()
-    await interaction.response.send_message(f"✅ Released the active key requirement for {user.mention}.", ephemeral=True)
 
-@bot.tree.command(name="reset_application", description="Let a user apply again immediately.")
-@app_commands.describe(user="User to reset")
-async def reset_application(interaction, user: discord.Member):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Owner only.", ephemeral=True)
-        return
-    update_user(user.id, application_cooldown_until=None)
-    await interaction.response.send_message(f"✅ Application cooldown reset for {user.mention}.", ephemeral=True)
+    await log_action(
+        "🔓 Key Requirement Released",
+        f"**User:** {user.mention}\n**Active key requirement removed**",
+        discord.Color.orange(),
+        user
+    )
+
+    await interaction.response.send_message(f"✅ Released the active key requirement for {user.mention}.", ephemeral=True)
 
 @bot.tree.command(name="add_thumbnails", description="Add thumbnail credits to a user.")
 @app_commands.describe(user="User to add credits to", amount="Number of credits to add")
-async def add_thumbnails(interaction, user: discord.Member, amount: int):
+async def add_thumbnails(interaction: discord.Interaction, user: discord.Member, amount: int):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
@@ -1576,6 +1798,14 @@ async def add_thumbnails(interaction, user: discord.Member, amount: int):
     con.close()
     
     updated_user = get_user(user.id)
+
+    await log_action(
+        "➕ Thumbnail Credits Added",
+        f"**User:** {user.mention}\n**Amount:** {amount}\n**New Balance:** {updated_user['thumbnail_balance']}",
+        discord.Color.green(),
+        user
+    )
+
     await interaction.response.send_message(
         f"✅ Added {amount} thumbnail credit(s) to {user.mention}.\n"
         f"New balance: **{updated_user['thumbnail_balance']}** credits",
@@ -1584,7 +1814,7 @@ async def add_thumbnails(interaction, user: discord.Member, amount: int):
 
 @bot.tree.command(name="add_keys", description="Add key credits to a user.")
 @app_commands.describe(user="User to add credits to", amount="Number of credits to add")
-async def add_keys(interaction, user: discord.Member, amount: int):
+async def add_keys(interaction: discord.Interaction, user: discord.Member, amount: int):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
@@ -1602,9 +1832,157 @@ async def add_keys(interaction, user: discord.Member, amount: int):
     con.close()
     
     updated_user = get_user(user.id)
+
+    await log_action(
+        "➕ Key Credits Added",
+        f"**User:** {user.mention}\n**Amount:** {amount}\n**New Balance:** {updated_user['balance']}",
+        discord.Color.green(),
+        user
+    )
+
     await interaction.response.send_message(
         f"✅ Added {amount} key credit(s) to {user.mention}.\n"
         f"New balance: **{updated_user['balance']}** credits",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="check_expired_keys", description="Check for users who haven't submitted videos within 48 hours.")
+async def check_expired_keys(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    con = db()
+    active_rows = con.execute(
+        """SELECT * FROM active_keys 
+           WHERE requirement_completed=0 
+           AND datetime(issued_at) < datetime(?, '-48 hours')""",
+        (iso(now()),)
+    ).fetchall()
+    con.close()
+
+    if not active_rows:
+        await interaction.followup.send("✅ No users have expired key requirements.", ephemeral=True)
+        return
+
+    message = "**⚠️ Users with Expired Key Requirements (48h+):**\n\n"
+    for row in active_rows:
+        user = await bot.fetch_user(row["user_id"])
+        message += f"• {user.mention if user else f'<@{row["user_id"]}>'} - {row['game']} ({row['duration']})\n"
+
+    await interaction.followup.send(message[:4000], ephemeral=True)
+
+@bot.tree.command(name="unrole_expired", description="Remove Media Creator role from users who didn't submit videos in 48 hours.")
+async def unrole_expired(interaction: discord.Interaction):
+    """Automatically remove Media Creator role from users with expired key requirements."""
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    role = guild.get_role(MEDIA_ROLE_ID)
+    if not role:
+        await interaction.followup.send("❌ Media Creator role not configured.", ephemeral=True)
+        return
+
+    con = db()
+    expired_users = con.execute(
+        """SELECT user_id FROM active_keys 
+           WHERE requirement_completed=0 
+           AND datetime(issued_at) < datetime(?, '-48 hours')""",
+        (iso(now()),)
+    ).fetchall()
+    con.close()
+
+    if not expired_users:
+        await interaction.followup.send("✅ No users to unrole.", ephemeral=True)
+        return
+
+    removed = []
+    failed = []
+    
+    for row in expired_users:
+        member = guild.get_member(row["user_id"])
+        if member and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Failed to submit required video within 48 hours")
+                removed.append(member.mention)
+                
+                await log_action(
+                    "🚫 Auto-Unrole",
+                    f"**User:** {member.mention}\n**Reason:** Failed to submit video within 48 hours",
+                    discord.Color.red(),
+                    member
+                )
+            except:
+                failed.append(member.mention)
+
+    # Clean up their active key record
+    con = db()
+    for row in expired_users:
+        con.execute("DELETE FROM active_keys WHERE user_id=?", (row["user_id"],))
+    con.commit()
+    con.close()
+
+    response = f"✅ Removed Media Creator role from {len(removed)} users."
+    if failed:
+        response += f"\n❌ Failed to remove from: {', '.join(failed)}"
+    
+    await interaction.followup.send(response, ephemeral=True)
+
+@bot.tree.command(name="stats_user", description="View detailed stats for a specific user.")
+@app_commands.describe(user="User to view stats for")
+async def stats_user(interaction: discord.Interaction, user: discord.Member):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    user_data = get_user(user.id)
+    active = get_active_key(user.id)
+
+    con = db()
+    submissions = con.execute(
+        """SELECT platform, status, created_at FROM submissions 
+           WHERE user_id=? ORDER BY created_at DESC LIMIT 5""",
+        (user.id,)
+    ).fetchall()
+    con.close()
+
+    description = (
+        f"**User:** {user.mention}\n"
+        f"**Balance:** {user_data['balance']} credits\n"
+        f"**Thumbnail Credits:** {user_data['thumbnail_balance']}\n"
+        f"**Free Key Used:** {'✅' if user_data['free_key_used'] else '❌'}\n"
+        f"**Free Thumbnail Used:** {'✅' if user_data['free_thumbnail_used'] else '❌'}\n"
+        f"**Approved TikToks:** {user_data['tiktok_approved']}\n"
+        f"**Approved YouTube:** {user_data['youtube_approved']}\n\n"
+    )
+
+    if active:
+        description += f"**Active Key:**\n"
+        description += f"• Game: {active['game']}\n"
+        description += f"• Duration: {active['duration']}\n"
+        description += f"• Requirement: {active['requirement_target']} {active['requirement_platform']}(s)\n"
+        description += f"• Completed: {'✅' if active['requirement_completed'] else '❌'}\n"
+        if not active['requirement_completed']:
+            deadline = parse_dt(active['expires_at'])
+            if deadline:
+                description += f"• Deadline: {discord.utils.format_dt(deadline, 'R')}\n"
+    else:
+        description += f"**Active Key:** None\n"
+
+    if submissions:
+        description += f"\n**Recent Submissions:**\n"
+        for sub in submissions:
+            status_emoji = "✅" if sub["status"] == "approved" else "❌" if sub["status"] == "declined" else "⏳"
+            description += f"• {status_emoji} {sub['platform']} - {sub['status']} ({discord.utils.format_dt(parse_dt(sub['created_at']), 'R')})\n"
+
+    await interaction.response.send_message(
+        embed=base_embed(f"📊 Stats for {user.display_name}", description[:4000]),
         ephemeral=True
     )
 
@@ -1613,8 +1991,6 @@ async def add_keys(interaction, user: discord.Member, amount: int):
 # -----------------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """Tiny HTTP endpoint so Render can treat this as a Web Service."""
-
     def do_GET(self):
         if self.path not in ("/", "/health", "/healthz"):
             self.send_response(404)
@@ -1635,12 +2011,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # Keep Render logs focused on the bot instead of HTTP probe noise.
         return
 
-
 health_server = None
-
 
 def start_health_server():
     global health_server
@@ -1649,11 +2022,14 @@ def start_health_server():
     print(f"Health server listening on 0.0.0.0:{port}")
     health_server.serve_forever(poll_interval=0.5)
 
-
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
-
+    await log_action(
+        "🟢 Bot Online",
+        f"Bot is now online!\n**Bot:** {bot.user.mention}\n**Guilds:** {len(bot.guilds)}",
+        discord.Color.green()
+    )
 
 if __name__ == "__main__":
     if not TOKEN:
@@ -1663,10 +2039,6 @@ if __name__ == "__main__":
 
     init_db()
 
-    # Render Web Services require one process to listen on $PORT.
-    # Run the health endpoint in a daemon thread while the Discord bot
-    # remains the main process, so a bot crash also makes the service fail
-    # instead of leaving a misleading HTTP-only process running.
     threading.Thread(
         target=start_health_server,
         name="render-health-server",
