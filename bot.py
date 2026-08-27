@@ -2025,6 +2025,27 @@ def start_health_server():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
+    
+    # Force sync commands to guild
+    if GUILD_ID:
+        guild = discord.Object(id=GUILD_ID)
+        try:
+            # Clear old commands first
+            self.tree.clear_commands(guild=guild)
+            await self.tree.sync(guild=guild)
+            print("Cleared old guild commands")
+        except:
+            pass
+            
+        # Copy global commands to guild
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        print(f"Synced commands to guild {GUILD_ID}")
+        
+        # List all synced commands
+        commands = await self.tree.fetch_commands(guild=guild)
+        print(f"Available commands: {[cmd.name for cmd in commands]}")
+    
     await log_action(
         "🟢 Bot Online",
         f"Bot is now online!\n**Bot:** {bot.user.mention}\n**Guilds:** {len(bot.guilds)}",
